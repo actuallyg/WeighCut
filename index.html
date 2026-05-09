@@ -4,6 +4,14 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Cut Plan</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script>
+  const SUPABASE_URL = 'https://dkmsazgergypurmesftm.supabase.co';
+  const SUPABASE_KEY = 'sb_publishable_1_qu5gYO4WChM2iy6cRuaA_Ev3N_hdI';
+  // Will be initialized after DOM loads
+  let sb = null;
+  let currentUser = null;
+</script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -1781,22 +1789,81 @@
     return `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
   }
 
-  function loadState(key) {
+  // === SUPABASE STORAGE ===
+  // In-memory state (loaded from Supabase on startup, written through on changes)
+  let mealState = { week: getWeekId(), checks: {} };
+  let gymState = { week: getWeekId(), checks: {} };
+  let weightLog = [];
+  let cachedSettings = {};
+
+  async function loadFromSupabase() {
+    if (!sb) return;
     try {
-      const data = JSON.parse(localStorage.getItem(key) || '{}');
-      if (data.week !== getWeekId()) return { week: getWeekId(), checks: {} };
-      return data;
+      const wkId = getWeekId();
+
+      // Load meal checks for current week only
+      const { data: mealRows } = await sb.from('meal_checks').select('*').eq('week_id', wkId);
+      mealState = { week: wkId, checks: {} };
+      (mealRows || []).forEach(r => {
+        mealState.checks[`${r.meal_key}_${r.day_idx}`] = true;
+      });
+
+      // Load gym checks for current week only
+      const { data: gymRows } = await sb.from('gym_checks').select('*').eq('week_id', wkId);
+      gymState = { week: wkId, checks: {} };
+      (gymRows || []).forEach(r => {
+        gymState.checks[`${r.workout_key}_${r.day_idx}`] = true;
+      });
+
+      // Load all weights
+      const { data: weightRows } = await sb.from('weights').select('*').order('date');
+      weightLog = (weightRows || []).map(r => ({ date: r.date, weight: parseFloat(r.weight) }));
+
+      // Load settings
+      const { data: settingsRows } = await sb.from('settings').select('*');
+      cachedSettings = {};
+      (settingsRows || []).forEach(r => { cachedSettings[r.key] = r.value; });
+
     } catch (e) {
-      return { week: getWeekId(), checks: {} };
+      console.error('Supabase load failed', e);
     }
   }
 
-  function saveState(key, data) {
-    try { localStorage.setItem(key, JSON.stringify(data)); } catch(e) {}
+  async function saveMealCheck(mealKey, dayIdx, checked) {
+    if (!sb) return;
+    const wkId = getWeekId();
+    if (checked) {
+      await sb.from('meal_checks').upsert({ week_id: wkId, meal_key: mealKey, day_idx: dayIdx });
+    } else {
+      await sb.from('meal_checks').delete().eq('week_id', wkId).eq('meal_key', mealKey).eq('day_idx', dayIdx);
+    }
   }
 
-  let mealState = loadState('meal_checks');
-  let gymState = loadState('gym_checks');
+  async function saveGymCheck(workoutKey, dayIdx, checked) {
+    if (!sb) return;
+    const wkId = getWeekId();
+    if (checked) {
+      await sb.from('gym_checks').upsert({ week_id: wkId, workout_key: workoutKey, day_idx: dayIdx });
+    } else {
+      await sb.from('gym_checks').delete().eq('week_id', wkId).eq('workout_key', workoutKey).eq('day_idx', dayIdx);
+    }
+  }
+
+  async function saveWeightToDb(date, weight) {
+    if (!sb) return;
+    await sb.from('weights').upsert({ date, weight });
+  }
+
+  async function deleteWeightFromDb(date) {
+    if (!sb) return;
+    await sb.from('weights').delete().eq('date', date);
+  }
+
+  async function saveSetting(key, value) {
+    if (!sb) return;
+    await sb.from('settings').upsert({ key, value });
+    cachedSettings[key] = value;
+  }
 
   function getCount(state, itemKey) {
     let count = 0;
@@ -1813,28 +1880,39 @@
     return null;
   }
 
-  function toggleMealDay(itemKey, dayIdx) {
+  async function toggleMealDay(itemKey, dayIdx) {
     const key = `${itemKey}_${dayIdx}`;
+    // If turning ON and another meal is on this day, remove that one first
     if (!mealState.checks[key]) {
       const existing = getItemForDay(mealState, meals, dayIdx);
-      if (existing && existing !== itemKey) delete mealState.checks[`${existing}_${dayIdx}`];
+      if (existing && existing !== itemKey) {
+        delete mealState.checks[`${existing}_${dayIdx}`];
+        await saveMealCheck(existing, dayIdx, false);
+      }
     }
-    mealState.checks[key] = !mealState.checks[key];
-    saveState('meal_checks', mealState);
+    const newVal = !mealState.checks[key];
+    mealState.checks[key] = newVal;
+    await saveMealCheck(itemKey, dayIdx, newVal);
     if (currentMealKey) renderMealDetail(currentMealKey);
     renderMealMaster();
+    renderOverview();
   }
 
-  function toggleGymDay(itemKey, dayIdx) {
+  async function toggleGymDay(itemKey, dayIdx) {
     const key = `${itemKey}_${dayIdx}`;
     if (!gymState.checks[key]) {
       const existing = getItemForDay(gymState, workouts, dayIdx);
-      if (existing && existing !== itemKey) delete gymState.checks[`${existing}_${dayIdx}`];
+      if (existing && existing !== itemKey) {
+        delete gymState.checks[`${existing}_${dayIdx}`];
+        await saveGymCheck(existing, dayIdx, false);
+      }
     }
-    gymState.checks[key] = !gymState.checks[key];
-    saveState('gym_checks', gymState);
+    const newVal = !gymState.checks[key];
+    gymState.checks[key] = newVal;
+    await saveGymCheck(itemKey, dayIdx, newVal);
     if (currentGymKey) renderGymDetail(currentGymKey);
     renderGymMaster();
+    renderOverview();
   }
 
   // === COUNTDOWN ===
@@ -2231,19 +2309,16 @@
     { num: 12, startW: 93.5, endW: 93.0, phase: 'Grind' }
   ];
 
-  // Configurable start date stored in localStorage (defaults to May 9, 2026)
+  // Configurable start date stored in Supabase settings (defaults to May 9, 2026)
   function getCutStart() {
-    try {
-      const saved = localStorage.getItem('cut_start_date');
-      if (saved) return new Date(saved);
-    } catch(e) {}
+    if (cachedSettings.cut_start_date) {
+      return new Date(cachedSettings.cut_start_date);
+    }
     return new Date(2026, 4, 9);
   }
 
   function setCutStart(dateStr) {
-    try {
-      localStorage.setItem('cut_start_date', dateStr);
-    } catch(e) {}
+    saveSetting('cut_start_date', dateStr);
   }
 
   function getCurrentWeekNum() {
@@ -2266,13 +2341,12 @@
 
   // === WEIGH-IN ===
   function loadWeights() {
-    try {
-      return JSON.parse(localStorage.getItem('weight_log') || '[]');
-    } catch(e) { return []; }
+    return weightLog;
   }
 
-  function saveWeights(arr) {
-    try { localStorage.setItem('weight_log', JSON.stringify(arr)); } catch(e) {}
+  async function saveWeights(arr) {
+    // Not used directly anymore - logWeight/deleteWeight handle individual rows
+    weightLog = arr;
   }
 
   function todayKey() {
@@ -2287,30 +2361,29 @@
     return e ? e.weight : null;
   }
 
-  function logWeight(weight) {
+  async function logWeight(weight) {
     const w = parseFloat(weight);
     if (isNaN(w) || w <= 0 || w > 300) return false;
-    const log = loadWeights();
     const k = todayKey();
-    const idx = log.findIndex(x => x.date === k);
-    if (idx >= 0) log[idx].weight = w;
-    else log.push({ date: k, weight: w });
-    log.sort((a, b) => a.date.localeCompare(b.date));
-    saveWeights(log);
+    const idx = weightLog.findIndex(x => x.date === k);
+    if (idx >= 0) weightLog[idx].weight = w;
+    else weightLog.push({ date: k, weight: w });
+    weightLog.sort((a, b) => a.date.localeCompare(b.date));
+    await saveWeightToDb(k, w);
     return true;
   }
 
-  function deleteWeight(date) {
-    const log = loadWeights().filter(x => x.date !== date);
-    saveWeights(log);
+  async function deleteWeight(date) {
+    weightLog = weightLog.filter(x => x.date !== date);
+    await deleteWeightFromDb(date);
     renderWeighIn();
     renderOverview();
   }
 
-  function saveTodayWeight() {
+  async function saveTodayWeight() {
     const input = document.getElementById('weighin-input');
     const msg = document.getElementById('weighin-msg');
-    if (logWeight(input.value)) {
+    if (await logWeight(input.value)) {
       msg.textContent = '✓ Saved';
       msg.style.color = '#2e7d32';
       input.value = '';
@@ -2323,9 +2396,9 @@
     }
   }
 
-  function saveTodayWeightMini() {
+  async function saveTodayWeightMini() {
     const input = document.getElementById('today-weight-input');
-    if (input && logWeight(input.value)) {
+    if (input && await logWeight(input.value)) {
       input.value = '';
       renderWeighIn();
       renderOverview();
@@ -2899,11 +2972,24 @@
     if (page === 'weighin') renderWeighIn();
   }
 
-  // Init
-  renderOverview();
-  renderMealMaster();
-  renderGymMaster();
-  renderWeighIn();
+  // === BOOTSTRAP ===
+  async function bootstrap() {
+    // Initialize Supabase client
+    if (window.supabase) {
+      sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+      await loadFromSupabase();
+    } else {
+      console.error('Supabase library failed to load');
+    }
+
+    // Render all pages with loaded data
+    renderOverview();
+    renderMealMaster();
+    renderGymMaster();
+    renderWeighIn();
+  }
+
+  bootstrap();
 </script>
 </body>
 </html>
